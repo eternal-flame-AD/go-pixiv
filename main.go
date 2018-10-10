@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/eternal-flame-AD/goproxy"
@@ -52,6 +53,7 @@ var (
 	PixivDomainsWithPort []string
 
 	FakeConfigCache = make(map[string]*tls.Config, 0)
+	IPCache         = make(map[string]string)
 )
 
 func orPanic(err error) {
@@ -115,8 +117,45 @@ func main() {
 
 		clientBuf := bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
 
-		remoteraw, err := net.Dial("tcp", ctx.Req.Host)
-		orPanic(err)
+		remoteraw := func() net.Conn {
+			if ip, ok := IPCache[ctx.Req.URL.Hostname()]; ok {
+				remoteraw, err := net.Dial("tcp", ip+ctx.Req.Host[strings.LastIndex(ctx.Req.Host, ":"):])
+				if err == nil {
+					if verbose {
+						log.Println("Successfully retrieved IP cache for " + ctx.Req.URL.Hostname())
+					}
+					return remoteraw
+				}
+			}
+			query := DNSQuery{
+				ctx.Req.URL.Hostname(),
+				"A",
+				"https://1.1.1.1/dns-query",
+				false,
+				false,
+			}
+			res, err := query.Do()
+			orPanic(err)
+			for _, ans := range res.Answer {
+				var err error
+				if ans.Type != 1 {
+					continue
+				}
+				fmt.Println(ans.Data + ctx.Req.Host[strings.LastIndex(ctx.Req.Host, ":"):])
+				remoteraw, err := net.Dial("tcp", ans.Data+ctx.Req.Host[strings.LastIndex(ctx.Req.Host, ":"):])
+				if err == nil {
+					IPCache[ctx.Req.URL.Hostname()] = ans.Data
+					return remoteraw
+				}
+				if verbose {
+					fmt.Println("Error while attempting connect: " + err.Error())
+				}
+			}
+			return nil
+		}()
+		if remoteraw == nil {
+			panic("No available IPs for " + ctx.Req.URL.Hostname())
+		}
 		defer remoteraw.Close()
 
 		remote := tls.Client(remoteraw, &tls.Config{
