@@ -19,6 +19,12 @@ import (
 )
 
 var (
+	BlackHoleDomains = []string{
+		"www.google.com",
+		"google.com",
+		"fonts.googleapis.com",
+	}
+
 	PixivDomains = []string{
 		"pixiv.net",
 		"www.pixiv.net",
@@ -50,7 +56,8 @@ var (
 		"pximg.net",
 	}
 
-	PixivDomainsWithPort []string
+	PixivDomainsWithPort     []string
+	BlackHoleDomainsWithPort []string
 
 	FakeConfigCache = make(map[string]*tls.Config, 0)
 	IPCache         = make(map[string]string)
@@ -64,8 +71,12 @@ func orPanic(err error) {
 
 func init() {
 	PixivDomainsWithPort = make([]string, len(PixivDomains))
+	BlackHoleDomainsWithPort = make([]string, len(BlackHoleDomains))
 	for i, name := range PixivDomains {
 		PixivDomainsWithPort[i] = name + ":443"
+	}
+	for i, name := range BlackHoleDomains {
+		BlackHoleDomainsWithPort[i] = name + ":443"
 	}
 }
 
@@ -81,6 +92,9 @@ func main() {
 	verbose := verbosevar.Get().(bool)
 
 	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest(
+		goproxy.ReqHostIs(BlackHoleDomainsWithPort...),
+	).HandleConnect(goproxy.AlwaysReject)
 	proxy.OnRequest(
 		goproxy.ReqHostIs(PixivDomainsWithPort...),
 	).HijackConnect(func(req *http.Request, clientraw net.Conn, ctx *goproxy.ProxyCtx) {
