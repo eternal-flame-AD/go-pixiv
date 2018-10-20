@@ -95,11 +95,10 @@ func main() {
 	proxy.OnRequest(
 		goproxy.ReqHostIs(BlackHoleDomainsWithPort...),
 	).HandleConnect(goproxy.AlwaysReject)
+
 	proxy.OnRequest(
 		goproxy.ReqHostIs(PixivDomainsWithPort...),
 	).HijackConnect(func(req *http.Request, clientraw net.Conn, ctx *goproxy.ProxyCtx) {
-		fmt.Println(ctx.Req.URL.Host, ctx.Req.URL.Hostname())
-
 		defer func() {
 			if e := recover(); e != nil {
 				ctx.Logf("error connecting to remote: %v", e)
@@ -110,6 +109,8 @@ func main() {
 			}
 			clientraw.Close()
 		}()
+
+		log.Printf("Establishing connection to %s\n", ctx.Req.URL.Hostname())
 
 		processchan := make(chan error)
 		clientTLSConfig, err := func(host string) (*tls.Config, error) {
@@ -144,10 +145,11 @@ func main() {
 			query := DNSQuery{
 				ctx.Req.URL.Hostname(),
 				"A",
-				"https://1.1.1.1/dns-query",
+				"https://1.0.0.1/dns-query",
 				false,
 				false,
 			}
+			log.Printf("Obtaining DNS records for %s\n", ctx.Req.URL.Hostname())
 			res, err := query.Do()
 			orPanic(err)
 			for _, ans := range res.Answer {
@@ -155,7 +157,6 @@ func main() {
 				if ans.Type != 1 {
 					continue
 				}
-				fmt.Println(ans.Data + ctx.Req.Host[strings.LastIndex(ctx.Req.Host, ":"):])
 				remoteraw, err := net.Dial("tcp", ans.Data+ctx.Req.Host[strings.LastIndex(ctx.Req.Host, ":"):])
 				if err == nil {
 					IPCache[ctx.Req.URL.Hostname()] = ans.Data
@@ -170,12 +171,14 @@ func main() {
 		if remoteraw == nil {
 			panic("No available IPs for " + ctx.Req.URL.Hostname())
 		}
+		if verbose {
+			log.Printf("Estabished remote connection for %s (%s)\n", ctx.Req.URL.Hostname(), remoteraw.RemoteAddr())
+		}
 		defer remoteraw.Close()
 
 		remote := tls.Client(remoteraw, &tls.Config{
 			InsecureSkipVerify: true,
 			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-				log.Println("verifying cert for ", ctx.Req.URL.Hostname())
 				certs := make([]*x509.Certificate, len(rawCerts))
 				for i, c := range rawCerts {
 					var err error
@@ -207,14 +210,13 @@ func main() {
 					}
 				}
 				if err != nil {
-					log.Printf("Refusing to connect to %s: Cert invalid\n", ctx.Req.URL.Hostname())
-					log.Println(certs[0].DNSNames)
+					log.Printf("Refusing to connect to %s: Cert invalid: Remote certificate is for %s\n", ctx.Req.URL.Hostname(), certs[0].DNSNames)
 				}
 				return err
 			},
 		})
 		orPanic(remote.Handshake())
-		fmt.Println("Handshake success")
+		log.Printf("Handshake to %s succeeded:)\n", ctx.Req.URL.Hostname())
 		defer remote.Close()
 		remoteBuf := bufio.NewReadWriter(bufio.NewReader(remote), bufio.NewWriter(remote))
 
@@ -265,6 +267,10 @@ func main() {
 
 		orPanic(<-processchan)
 		orPanic(<-processchan)
+
+		if verbose {
+			log.Println("Closing connection for " + ctx.Req.URL.Hostname())
+		}
 	})
 	proxy.Verbose = verbose
 	log.Fatal(http.ListenAndServe(*listen, proxy))
