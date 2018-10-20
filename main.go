@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/eternal-flame-AD/goproxy"
@@ -60,7 +61,10 @@ var (
 	BlackHoleDomainsWithPort []string
 
 	FakeConfigCache = make(map[string]*tls.Config, 0)
-	IPCache         = make(map[string]string)
+	IPCache         = struct {
+		Data map[string]string
+		Lock sync.RWMutex
+	}{make(map[string]string), sync.RWMutex{}}
 )
 
 func orPanic(err error) {
@@ -88,6 +92,7 @@ func main() {
 	verbosevar := boolflag{new(bool)}
 	flag.Var(verbosevar, "v", "verbose")
 	listen := flag.String("l", ":8080", "listen address")
+	endpoint := flag.String("e", "https://1.0.0.1/dns-query", "DoH endpoint")
 	flag.Parse()
 	verbose := verbosevar.Get().(bool)
 
@@ -133,7 +138,10 @@ func main() {
 		clientBuf := bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
 
 		remoteraw := func() net.Conn {
-			if ip, ok := IPCache[ctx.Req.URL.Hostname()]; ok {
+			IPCache.Lock.RLock()
+			ip, ok := IPCache.Data[ctx.Req.URL.Hostname()]
+			IPCache.Lock.RUnlock()
+			if ok {
 				remoteraw, err := net.Dial("tcp", ip+ctx.Req.Host[strings.LastIndex(ctx.Req.Host, ":"):])
 				if err == nil {
 					if verbose {
@@ -145,7 +153,7 @@ func main() {
 			query := DNSQuery{
 				ctx.Req.URL.Hostname(),
 				"A",
-				"https://1.0.0.1/dns-query",
+				*endpoint,
 				false,
 				false,
 			}
@@ -159,7 +167,9 @@ func main() {
 				}
 				remoteraw, err := net.Dial("tcp", ans.Data+ctx.Req.Host[strings.LastIndex(ctx.Req.Host, ":"):])
 				if err == nil {
-					IPCache[ctx.Req.URL.Hostname()] = ans.Data
+					IPCache.Lock.Lock()
+					IPCache.Data[ctx.Req.URL.Hostname()] = ans.Data
+					IPCache.Lock.Unlock()
 					return remoteraw
 				}
 				if verbose {
