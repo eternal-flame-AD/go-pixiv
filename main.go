@@ -2,12 +2,16 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"html/template"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -94,9 +98,51 @@ func main() {
 	listen := flag.String("l", ":8080", "listen address")
 	endpoint := flag.String("e", "https://1.0.0.1/dns-query", "DoH endpoint")
 	flag.Parse()
-	verbose := verbosevar.Get().(bool)
+	Config.DNSEndpoint = *endpoint
+	Config.Verbose = verbosevar.Get().(bool)
 
 	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest(
+		goproxy.ReqHostIs("go-pixiv.local"),
+	).DoFunc(func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		client := http.Client{}
+		r.URL.Host = "127.0.0.1:8081"
+		req, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
+		req.Header.Add("X-Proxy-Thru", "1")
+		resp, err := client.Do(req)
+		if err != nil {
+			return r, nil
+		}
+		resp.Header.Add("X-Proxy-Thru", "1")
+		resp.Header.Add("Access-Control-Allow-Origin", "*")
+		return r, resp
+	})
+
+	proxy.OnRequest(
+		goproxy.ReqHostIs("go-pixiv.local:443"),
+	).HijackConnect(func(req *http.Request, clientraw net.Conn, ctx *goproxy.ProxyCtx) {
+		cfg, err := goproxy.TLSConfigFromCA(&goproxy.GoproxyCa)("go-pixiv.local", ctx)
+		if err != nil {
+			log.Panicln(err)
+		}
+		server := tls.Server(clientraw, cfg)
+		body := ""
+		resp := &http.Response{
+			Status:        "200 OK",
+			StatusCode:    200,
+			Proto:         "HTTP/1.1",
+			ProtoMajor:    1,
+			ProtoMinor:    1,
+			Body:          ioutil.NopCloser(bytes.NewBufferString(body)),
+			ContentLength: int64(len(body)),
+			Request:       req,
+			Header:        make(http.Header, 0),
+		}
+		resp.Header.Add("Access-Control-Allow-Origin", "*")
+		resp.Write(server)
+		server.CloseWrite()
+	})
+
 	proxy.OnRequest(
 		goproxy.ReqHostIs(BlackHoleDomainsWithPort...),
 	).HandleConnect(goproxy.AlwaysReject)
@@ -107,7 +153,7 @@ func main() {
 		defer func() {
 			if e := recover(); e != nil {
 				ctx.Logf("error connecting to remote: %v", e)
-				if verbose {
+				if Config.Verbose {
 					debug.PrintStack()
 				}
 				clientraw.Write([]byte("HTTP/1.1 500 Cannot reach destination\r\n\r\n"))
@@ -144,7 +190,7 @@ func main() {
 			if ok {
 				remoteraw, err := net.Dial("tcp", ip+ctx.Req.Host[strings.LastIndex(ctx.Req.Host, ":"):])
 				if err == nil {
-					if verbose {
+					if Config.Verbose {
 						log.Println("Successfully retrieved IP cache for " + ctx.Req.URL.Hostname())
 					}
 					return remoteraw
@@ -153,7 +199,7 @@ func main() {
 			query := DNSQuery{
 				ctx.Req.URL.Hostname(),
 				"A",
-				*endpoint,
+				Config.DNSEndpoint,
 				false,
 				false,
 			}
@@ -172,7 +218,7 @@ func main() {
 					IPCache.Lock.Unlock()
 					return remoteraw
 				}
-				if verbose {
+				if Config.Verbose {
 					fmt.Println("Error while attempting connect: " + err.Error())
 				}
 			}
@@ -181,7 +227,7 @@ func main() {
 		if remoteraw == nil {
 			panic("No available IPs for " + ctx.Req.URL.Hostname())
 		}
-		if verbose {
+		if Config.Verbose {
 			log.Printf("Estabished remote connection for %s (%s)\n", ctx.Req.URL.Hostname(), remoteraw.RemoteAddr())
 		}
 		defer remoteraw.Close()
@@ -278,10 +324,166 @@ func main() {
 		orPanic(<-processchan)
 		orPanic(<-processchan)
 
-		if verbose {
+		if Config.Verbose {
 			log.Println("Closing connection for " + ctx.Req.URL.Hostname())
 		}
 	})
-	proxy.Verbose = verbose
+	proxy.Verbose = Config.Verbose
+
+	go func() {
+		managemux := http.NewServeMux()
+		managemux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("X-Proxy-Thru") == "" {
+				// No proxy, check proxy config with fetch
+				w.Header().Add("Content-Type", "text/html")
+				w.WriteHeader(200)
+				w.Write([]byte(`
+				<noscript>
+					Javascript is disabled. Go-Pixiv should work without it.
+				</noscript>
+				<script>
+					fetch("http://go-pixiv.local").then(()=>{
+						window.location.href="http://go-pixiv.local/"
+					}).catch(()=>{
+						document.body.innerHTML="Proxy is not enabled, please set your local proxy to http://127.0.0.1:8080/"
+					})
+				</script>`))
+				return
+			}
+
+			tpl, err := template.New("Manage-Main").Parse(`
+			<html>
+				<head>
+					<title>Go-Pixiv</title>
+					<style>
+						.ok {
+							color: green;
+						}
+						.error {
+							color: red;
+						}
+						.testing {
+							color: blue;
+						}
+					</style>
+				</head>
+				<body>
+					<h1>Go-Pixiv</h1>
+					<ul>
+						<li>Proxy Configuation: <span class="ok">OK</span></li>
+						<li>CA Trust: <span id="ca-test" class="testing">Testing...</span></li>
+						<li>DNS-Over-HTTPS: <span id="dns-test" class="testing">Testing...</span>
+							<ul>
+								{{range .}}
+									<li class="domain-test-item" data-domain='{{.}}'></li>
+								{{end}}
+							</ul>
+						</li>
+					</ul>
+					<button id="btn-go" onclick="window.location.href='https://www.pixiv.net/'" style="display: none;">Go Pixiv!</button>
+					<script>
+						let testpromises = []
+						testpromises.push(new Promise((resolve,reject)=>{
+							fetch("https://go-pixiv.local/").then(()=>{
+								document.querySelector("#ca-test").innerText = "OK";
+								document.querySelector("#ca-test").setAttribute("class", "ok")
+								resolve()
+							}).catch(e=>{
+								document.querySelector("#ca-test").innerHTML = "Error. Please check if you have the <a href=\"https://github.com/eternal-flame-AD/goproxy/raw/master/ca.pem\">CA certificate</a> installed properly.";
+								document.querySelector("#ca-test").setAttribute("class", "error")
+								reject()
+							})
+						}))
+						let dnspromises = []
+						for (let item of document.querySelectorAll(".domain-test-item")) {
+							let host = item.getAttribute("data-domain");
+							item.innerHTML = ` + "`" + `${host}: <span class="testing">Testing...<span>` + "`" + `
+							dnspromises.push(new Promise((resolve, reject)=>{
+								fetch("http://go-pixiv.local/dns?"+host).then(res=>res.json().then(data=>{
+									item.innerHTML = ` + "`" + `${host}: <span class="${data.success?"ok":"error"}">${data.success?"OK":"Error"} (${data.data})</span>` + "`" + `
+									resolve()
+								})).catch(e=>{
+									item.innerHTML = ` + "`" + `${host}: <span class="error">Error</span>` + "`" + `
+									reject()
+								})
+							}))
+						}
+						Promise.all(dnspromises).then(()=>{
+							document.querySelector("#dns-test").innerText = "OK";
+							document.querySelector("#dns-test").setAttribute("class", "ok")
+						}).catch(()=>{
+							document.querySelector("#dns-test").innerText = "Error";
+							document.querySelector("#dns-test").setAttribute("class", "error")
+						})
+						testpromises.push(...dnspromises)
+
+						Promise.all(testpromises).then(()=>{
+							document.querySelector("#btn-go").setAttribute("style", "")
+						})
+					</script>
+				</body>
+			</html>
+			`)
+			if err != nil {
+				log.Println(err)
+			}
+			w.WriteHeader(200)
+			tpl.Execute(w, PixivDomains)
+		})
+
+		managemux.HandleFunc("/dns", func(w http.ResponseWriter, r *http.Request) {
+			host := r.URL.RawQuery
+
+			response := struct {
+				Success bool   `json:"success"`
+				Data    string `json:"data"`
+			}{}
+			req := DNSQuery{
+				host,
+				"A",
+				Config.DNSEndpoint,
+				false,
+				false,
+			}
+			res, err := req.Do()
+			if err != nil {
+				response.Data = err.Error()
+				resp, _ := json.Marshal(response)
+				w.WriteHeader(500)
+				w.Write(resp)
+				return
+			}
+			for _, item := range res.Answer {
+				if item.Type != 1 {
+					continue
+				}
+
+				remoteraw, err := net.Dial("tcp", item.Data+":443")
+				if err != nil {
+					response.Success = false
+					response.Data = err.Error()
+					continue
+				}
+				response.Success = true
+				IPCache.Lock.Lock()
+				IPCache.Data[host] = item.Data
+				IPCache.Lock.Unlock()
+				response.Data = item.Data
+				remoteraw.Close()
+				break
+			}
+			resp, err := json.Marshal(response)
+			if err != nil {
+				log.Println(err)
+			}
+			w.WriteHeader(200)
+			w.Write(resp)
+		})
+		http.ListenAndServe("127.0.0.1:8081", managemux)
+	}()
+	go func() {
+		openbrowser("http://127.0.0.1:8081")
+	}()
+
 	log.Fatal(http.ListenAndServe(*listen, proxy))
 }
